@@ -50,9 +50,9 @@ cat maas.conf
 maas_url=http://<Enter_MAAS_URL>/MAAS
 ```
 To setup your credential to connect with MAAS API, run (Replace <YOUR_MAAS_API_KEY> with your actual MAAS API key):
-  9 ```bash
-  echo -n "<YOUR_MAAS_API_KEY>" | python3 -c 'import sys; from cryptography.fernet import Fernet; key=Fernet.generate_key(); open("maas_api.key","wb").write(key); data=sys.stdin.buffer.read(); open("maas_api_key.encrypted","wb").write(Fernet(key).encrypt(data)); print("wrote: maas_api.key and maas_api_key.encrypted")'
- 19 ```
+```bash
+echo -n "<YOUR_MAAS_API_KEY>" | python3 -c 'import sys; from cryptography.fernet import Fernet; key=Fernet.generate_key(); open("maas_api.key","wb").write(key); data=sys.stdin.buffer.read(); open("maas_api_key.encrypted","wb").write(Fernet(key).encrypt(data)); print("wrote: maas_api.key and maas_api_key.encrypted")'
+```
 ---
 
 ## Usage
@@ -60,18 +60,7 @@ Activate your virtual environment (if not already active), then run:
 ```bash
 python3 builder-reimage.py [OPTIONS]
 ```
-To setup your credential to connect with MAAS API, run:
-```bash
-echo -n "<YOUR_MAAS_API_KEY>" | python3 - <<'EOF'
-from cryptography.fernet import Fernet
-import sys
-key = Fernet.generate_key()
-open("maas_api.key","wb").write(key)
-data = sys.stdin.buffer.read()
-enc = Fernet(key).encrypt(data)
-open("maas_api_key.encrypted","wb").write(enc)
-EOF
-```
+
 ## Examples
 List all machines
 ```bash
