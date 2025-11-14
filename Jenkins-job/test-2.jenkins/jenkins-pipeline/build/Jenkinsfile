@@ -13,7 +13,7 @@ pipeline {
                 withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
                     sh '''#!/bin/bash
                         set -e
-                        cd "$WORKSPACE"
+                        cd "$WORKSPACE/Jenkins-job/test-2.jenkins"
 
                         # Clean old venv (if incompatible)
                         if [ -d "$VENV_DIR" ]; then
@@ -38,13 +38,13 @@ pipeline {
 
                     sh '''#!/bin/bash
                         set -e
-                        cd "$WORKSPACE"
+                        cd "$WORKSPACE/Jenkins-job/test-2.jenkins"
                         source "$VENV_DIR/bin/activate"
 
                         echo "Preparing command…"
 
                         # Base command: always include action
-                        CMD="python builder-reimage.py --action ${ACTION}"
+                        CMD="python Jenkins_builder-reimage.py --action ${ACTION}"
 
                         # Add machine if provided
                         if [ ! -z "${MACHINE}" ]; then
