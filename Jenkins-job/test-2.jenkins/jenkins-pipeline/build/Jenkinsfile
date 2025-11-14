@@ -44,7 +44,7 @@ pipeline {
                         echo "Preparing command…"
 
                         # Base command: always include action
-                        CMD="python Jenkins_builder-reimage.py --action ${ACTION}"
+                        CMD="python builder-reimage.py --action ${ACTION}"
 
                         # Add machine if provided
                         if [ ! -z "${MACHINE}" ]; then
