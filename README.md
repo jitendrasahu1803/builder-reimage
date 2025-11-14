@@ -94,6 +94,10 @@ Redeploy all machines with a specific OS
 ```bash
 --action redeploy-all --os jammy
 ```
+Find last deployed machine
+```bash
+--action last-deployed
+```
 ---
 
 ## Author
