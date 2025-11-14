@@ -1,0 +1,57 @@
+pipeline {
+    agent { label 'sepia' }
+
+    environment {
+        MAAS_URL = "http://refarch-r730xd-01.front.sepia.ceph.com:5240/MAAS"
+        VENV_DIR = ".venv"
+    }
+
+    stages {
+        stage('Setup Python Virtual Environment') {
+            steps {
+                withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
+                    sh '''#!/bin/bash
+                        set -e
+                        cd "$WORKSPACE"
+
+                        if [ -d "$VENV_DIR" ]; then
+                          echo "Removing incompatible virtual environment..."
+                          rm -rf "$VENV_DIR"
+                        fi
+
+                        echo "Creating new virtual environment..."
+                        python3 -m venv "$VENV_DIR"
+                        source "$VENV_DIR/bin/activate"
+
+                        pip install --upgrade pip
+                        pip install -r requirements.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Run Builder Script') {
+            steps {
+                withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
+                    sh '''#!/bin/bash
+                        set -e
+                        cd "$WORKSPACE"
+                        source "$VENV_DIR/bin/activate"
+                        echo "Running builder..."
+                        python Jenkins_builder-reimage.py --action list
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Build finished!'
+        }
+        failure {
+            echo 'Build failed'
+        }
+    }
+}
+

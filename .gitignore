@@ -1,0 +1,12 @@
+# Ignore files
+*.key
+*.encrypted
+*.log
+*.pyc
+*.tmp
+
+
+# Ignore directies
+.venv/
+venv
+logs

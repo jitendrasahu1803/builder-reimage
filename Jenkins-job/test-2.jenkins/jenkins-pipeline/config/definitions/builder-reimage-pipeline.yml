@@ -1,0 +1,30 @@
+- job:
+    name: builder-reimage-job
+    project-type: pipeline
+    description: "Pipeline to create virtualenv and run builder-reimage.py to reimage the Jenkins builders using Jenkinsfile"
+    concurrent: false
+
+    parameters:
+      - string:
+          name: ACTION
+          default: list
+          description: "Action to perform (e.g., list, reimage, status)"
+
+    scm:
+      - git:
+          url: https://github.com/jitendrasahu1803/builder-reimage.git
+          branches:
+            - main
+          clean: true
+
+    pipeline-scm:
+      scm:
+        - git:
+            url: https://github.com/jitendrasahu1803/builder-reimage.git
+            branches:
+              - main
+      script-path: Jenkins-job/test-2.jenkins/jenkins-pipeline/build/Jenkinsfile
+      lightweight-checkout: true
+
+#    triggers:
+#      - pollscm: "@daily"
