@@ -7,6 +7,7 @@ pipeline {
     }
 
     stages {
+
         stage('Setup Python Virtual Environment') {
             steps {
                 withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
@@ -14,12 +15,13 @@ pipeline {
                         set -e
                         cd "$WORKSPACE"
 
+                        # Clean old venv (if incompatible)
                         if [ -d "$VENV_DIR" ]; then
                           echo "Removing incompatible virtual environment..."
                           rm -rf "$VENV_DIR"
                         fi
 
-                        echo "Creating new virtual environment..."
+                        echo "Creating a fresh Python virtual environment..."
                         python3 -m venv "$VENV_DIR"
                         source "$VENV_DIR/bin/activate"
 
@@ -33,12 +35,32 @@ pipeline {
         stage('Run Builder Script') {
             steps {
                 withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
+
                     sh '''#!/bin/bash
                         set -e
                         cd "$WORKSPACE"
                         source "$VENV_DIR/bin/activate"
-                        echo "Running builder..."
-                        python Jenkins_builder-reimage.py --action list
+
+                        echo "Preparing command…"
+
+                        # Base command: always include action
+                        CMD="python Jenkins_builder-reimage.py --action ${ACTION}"
+
+                        # Add machine if provided
+                        if [ ! -z "${MACHINE}" ]; then
+                            CMD="$CMD --machine ${MACHINE}"
+                        fi
+
+                        # Add OS if provided
+                        if [ ! -z "${OS}" ]; then
+                            CMD="$CMD --os ${OS}"
+                        fi
+
+                        echo "Running builder command:"
+                        echo "$CMD"
+
+                        # Execute the final constructed command
+                        eval $CMD
                     '''
                 }
             }
@@ -50,8 +72,7 @@ pipeline {
             echo 'Build finished!'
         }
         failure {
-            echo 'Build failed'
+            echo 'Build failed!'
         }
     }
 }
-
