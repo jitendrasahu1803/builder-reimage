@@ -5,10 +5,26 @@
     concurrent: false
 
     parameters:
-      - string:
+      - choice:
           name: ACTION
+          choices:
+            - list
+            - query
+            - status
+            - redeploy
+            - redeploy-all
           default: list
-          description: "Action to perform (e.g., list, reimage, status)"
+          description: "Action to perform"
+
+      - string:
+          name: MACHINE
+          default: ""
+          description: "Machine name (required for: query, status, redeploy)"
+
+      - string:
+          name: OS
+          default: ""
+          description: "OS to deploy (optional). Example: jammy, 9.6. Used in: redeploy, redeploy-all"    
 
     scm:
       - git:
@@ -25,6 +41,3 @@
               - main
       script-path: Jenkins-job/test-2.jenkins/jenkins-pipeline/build/Jenkinsfile
       lightweight-checkout: true
-
-#    triggers:
-#      - pollscm: "@daily"
