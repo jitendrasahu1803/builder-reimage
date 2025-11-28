@@ -78,14 +78,34 @@ if command -v ansible-playbook >/dev/null 2>&1; then
   log "Ansible already installed."
 else
   log "Ansible not found, attempting to install into venv..."
+
+  # Determine package manager depending on OS
+  install_ansible_system() {
+    if command -v apt-get >/dev/null 2>&1; then
+      log "Detected apt-based system. Installing ansible..."
+      sudo apt-get update && sudo apt-get install -y ansible || true
+
+    elif command -v dnf >/dev/null 2>&1; then
+      log "Detected dnf-based system (RHEL8+/Rocky/Alma). Installing ansible-core..."
+      sudo dnf install -y ansible-core || sudo dnf install -y ansible || true
+
+    elif command -v yum >/dev/null 2>&1; then
+      log "Detected yum-based system (RHEL7/CentOS7). Installing ansible..."
+      sudo yum install -y ansible || true
+
+    else
+      log "No supported package manager found. Cannot install ansible."
+    fi
+  }
+
   if [ -n "${VENV_DIR}" ] && [ -f "${VENV_DIR}/bin/activate" ]; then
     pip install ansible || {
       log "Failed to install ansible in venv; trying system install (requires sudo)"
-      sudo apt-get update && sudo apt-get install -y ansible || true
+      install_ansible_system
     }
   else
     log "No venv available; attempting system install (requires sudo)"
-    sudo apt-get update && sudo apt-get install -y ansible || true
+    install_ansible_system
   fi
 fi
 
