@@ -110,9 +110,9 @@ ensure_symlink() {
 # Ensure /etc/ansible exists
 sudo mkdir -p /etc/ansible || true
 
-sudo rm /etc/ansible/secrets
+sudo rm -f /etc/ansible/secrets
 ensure_symlink "${SECRETS_DIR}/ansible/secrets" "/etc/ansible/secrets"
-sudo rm /etc/ansible/hosts
+sudo rm -f /etc/ansible/hosts
 ensure_symlink "${SECRETS_DIR}/ansible/inventory" "/etc/ansible/hosts"
 
 # Optional: Warn if target FQDN is not present in inventory file
