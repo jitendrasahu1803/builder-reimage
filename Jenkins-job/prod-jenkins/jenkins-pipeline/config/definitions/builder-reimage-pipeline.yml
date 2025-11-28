@@ -1,5 +1,5 @@
 - job:
-    name: builder-reimage-test
+    name: builder-reimage-job
     project-type: pipeline
     description: "Pipeline to reimage Jenkins builders and run post-reimage ansible tasks"
 
@@ -30,7 +30,7 @@
       - git:
           url: https://github.com/jitendrasahu1803/builder-reimage.git
           branches:
-            - wip-jenkins-pipeline
+            - main
           clean: true
 
     pipeline-scm:
@@ -38,6 +38,6 @@
         - git:
             url: https://github.com/jitendrasahu1803/builder-reimage.git
             branches:
-              - wip-jenkins-pipeline
+              - main
       script-path: Jenkins-job/prod-jenkins/jenkins-pipeline/build/Jenkinsfile
       lightweight-checkout: true
