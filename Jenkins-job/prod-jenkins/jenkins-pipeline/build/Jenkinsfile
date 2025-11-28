@@ -1,0 +1,196 @@
+pipeline {
+    agent { label 'reimage' }
+
+    environment {
+        VENV_DIR    = ".venv"
+        REPO_DIR    = "${WORKSPACE}/Jenkins-job/prod-jenkins"
+        VENV_PATH   = "${REPO_DIR}/${VENV_DIR}"
+        WORK_DIR    = "${WORKSPACE}/ci-work"
+        DOMAIN      = "front.sepia.ceph.com"
+    }
+
+    parameters {
+        booleanParam(name: 'SKIP_REIMAGE', defaultValue: false, description: 'Skip reimage stage and run only post-reimage tasks')
+        choice(name: 'ACTION', choices: ['reimage','reimage-all','wait_online'], description: 'Action to perform')
+        string(name: 'MACHINE', defaultValue: '', description: 'Machine shortname (e.g. irvingi08)')
+        string(name: 'OS', defaultValue: '', description: 'OS to deploy (optional). Example: jammy, focal')
+    }
+
+    stages {
+
+        /* ---------------------------------------------------------------------
+           Stage 1: Setup Python Virtual Environment
+        --------------------------------------------------------------------- */
+        stage('Setup Python Virtual Environment') {
+            steps {
+                withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+                        cd "$REPO_DIR"
+
+                        if [ -d "$VENV_PATH" ]; then
+                            echo "Removing incompatible virtual environment..."
+                            rm -rf "$VENV_PATH"
+                        fi
+
+                        python3 -m venv "$VENV_PATH"
+                        source "$VENV_PATH/bin/activate"
+
+                        pip install --upgrade pip
+                        pip install -r requirements.txt
+                    '''
+                }
+            }
+        }
+
+        /* ---------------------------------------------------------------------
+           Stage 2: Reimage Builder (Optional)
+        --------------------------------------------------------------------- */
+        stage('Reimage Builder') {
+            when {
+                expression { return params.SKIP_REIMAGE == false }
+            }
+            steps {
+                withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
+
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+
+                        OS="${OS:-}"
+
+                        cd "$REPO_DIR"
+                        source "$VENV_PATH/bin/activate"
+
+                        if [ -z "${MACHINE}" ]; then
+                            echo "Error: MACHINE parameter is required."
+                            exit 1
+                        fi
+
+                        echo "Preparing command…"
+                        CMD="python Jenkins_builder-reimage.py --action ${ACTION} --machine ${MACHINE}"
+
+                        if [ -n "${OS}" ]; then
+                            CMD="$CMD --os ${OS}"
+                        fi
+
+                        echo "Running builder command:"
+                        echo "$CMD"
+                        eval $CMD
+                    '''
+                }
+            }
+        }
+
+        /* ---------------------------------------------------------------------
+           Stage 3: Wait for Deployed State (only if we reimaged)
+        --------------------------------------------------------------------- */
+        stage('Wait for Ready/Deployed') {
+            when {
+                expression { return params.SKIP_REIMAGE == false }
+            }
+            steps {
+                withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
+                    script {
+                        echo "Waiting for ${MACHINE} to reach deployed/ready state..."
+
+                        sh '''#!/bin/bash
+                            set -euo pipefail
+                            cd "$REPO_DIR"
+                            source "$VENV_PATH/bin/activate"
+
+                            python Jenkins_builder-reimage.py --action wait_online --machine ${MACHINE}
+                        '''
+                    }
+                }
+            }
+        }
+
+        /* ---------------------------------------------------------------------
+           Stage 4: Post Reimage Tasks (Ansible)
+        --------------------------------------------------------------------- */
+        stage('Post Reimage Tasks') {
+            when {
+                allOf {
+                    expression { return currentBuild.result == null || currentBuild.result == 'SUCCESS' }
+                }
+            }
+            steps {
+                withCredentials([
+                    string(credentialsId: 'builder-api-token', variable: 'BUILDER_TOKEN'),
+                    string(credentialsId: 'ansible-vault-pass', variable: 'VAULT_PASS'),
+                    sshUserPrivateKey(credentialsId: 'ansible-ssh-key', keyFileVariable: 'SSH_KEY')
+                ]) {
+
+                    sh '''#!/bin/bash
+                        set -euo pipefail
+
+                        OS="${OS:-}"
+
+                        cd "$REPO_DIR"
+
+                        # Build FQDN from shortname
+                        if [ -z "${MACHINE}" ]; then
+                            echo "Error: MACHINE parameter is required for post reimage tasks."
+                            exit 1
+                        fi
+                        TARGET_FQDN="${MACHINE}.${DOMAIN}"
+                        echo "FQDN = ${TARGET_FQDN}"
+
+                        # Ensure work dir
+                        mkdir -p "${WORK_DIR}"
+
+                        # prepare private key for git clones (used by prepare_env)
+                        cp "${SSH_KEY}" /tmp/jenkins_git_key
+                        chmod 600 /tmp/jenkins_git_key
+
+
+
+                        ###########################################################################
+                        # CREATE VAULT PASSWORD FILE SECURELY
+                        # /home/jenkins-build/.vault_pass.txt
+                        ###########################################################################
+                        VAULT_FILE="/home/jenkins-build/.vault_pass.txt"
+                        TMP_FILE="$(mktemp /tmp/vault.XXXXXX)"
+
+                        umask 077
+                        printf "%s" "${VAULT_PASS}" > "${TMP_FILE}"
+
+                        mv -f "${TMP_FILE}" "${VAULT_FILE}"
+                        chown jenkins:jenkins "${VAULT_FILE}" 2>/dev/null || true
+                        chmod 600 "${VAULT_FILE}"
+
+                        echo "[INFO] Vault password file created at ${VAULT_FILE}"
+                        ###########################################################################
+
+
+
+                        # Call prepare_env
+                        cd "$WORKSPACE/Jenkins-job/prod-jenkins/jenkins-pipeline/build"
+                        bash scripts/prepare_env.sh "${TARGET_FQDN}" "${WORK_DIR}" true \
+                            git@github.com:ceph/ceph-build.git \
+                            git@github.com:ceph/ceph-cm-ansible.git \
+                            git@github.com:ceph/ceph-sepia-secrets.git
+
+                        # Call ansible runner
+                        cd "$WORKSPACE/Jenkins-job/prod-jenkins/jenkins-pipeline/build"
+                        bash scripts/ansible_runner.sh \
+                            "${TARGET_FQDN}" \
+                            "${WORK_DIR}" \
+                            "${VENV_PATH}" \
+                            "${OS}" \
+                            "${BUILDER_TOKEN}" \
+                            "${VAULT_PASS}"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always { 
+            sh 'rm -f /home/jenkins-build/.vault_pass.txt || true'
+            echo 'Build finished!' 
+        }
+        failure { echo 'Build failed!' }
+    }
+}
