@@ -36,7 +36,7 @@ fi
 ##############################################
 # Determine SSH user based on OS
 ##############################################
-if [[ "$OS_VALUE" =~ (rhel|centos|rocky|alma) ]]; then
+if [[ "$OS_VALUE" =~ (rhel|centos|rocky|almai|9-stream|rhel10|centos70|8) ]]; then
     SSH_USER="cloud-user"
 else
     SSH_USER="ubuntu"
