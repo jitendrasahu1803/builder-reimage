@@ -1,0 +1,26 @@
+# Ignore node_modules
+node_modules/
+
+# Ignore macOS files
+.DS_Store
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore env files
+.env
+
+# Ignore logs
+*.log
+
+# Ignore build artifacts
+build/
+dist/
+
+# Ignore key files
+*.key
+*.encrypted
+
+# Ignore log files
+*.log
