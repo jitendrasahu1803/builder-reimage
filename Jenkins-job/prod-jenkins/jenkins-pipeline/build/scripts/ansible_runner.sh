@@ -109,6 +109,7 @@ run_playbook() {
 
   CMD="ansible-playbook ansible_managed.yml \
         --limit='${TARGET_FQDN}' \
+        --ssh-extra-args="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
         -e ansible_ssh_user='${SSH_USER}'"
 
   run_playbook "play1-ansible_managed" "${CMD}"
@@ -126,6 +127,7 @@ run_playbook() {
   CMD="ansible-playbook users.yml -v \
         --limit='${TARGET_FQDN}' \
         --tags='user,pubkeys' \
+        --ssh-extra-args="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
         --extra-vars='${ADMIN_USERS_JSON}'"
 
   run_playbook "play2-users" "${CMD}"
@@ -139,6 +141,7 @@ run_playbook() {
   cd "${ANSIBLE_DIR}"
 
   CMD="ansible-playbook -vvv tools/jenkins-builder-disk.yml \
+        --ssh-extra-args="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \ 
         --limit='${TARGET_FQDN}'"
 
   run_playbook "play3-tools-disk" "${CMD}"
@@ -157,6 +160,7 @@ run_playbook() {
         examples/builder.yml \
         -e '{\"token\":\"${BUILDER_TOKEN}\", \"jenkins_credentials_uuid\":\"jenkins-build\", \"api_uri\":\"https://jenkins.ceph.com\"}' \
         -e permanent=true \
+        --ssh-extra-args="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
         --limit='${TARGET_FQDN}'"
 
   run_playbook "play4-main-builder" "${CMD}"
