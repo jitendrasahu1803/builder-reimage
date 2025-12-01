@@ -51,42 +51,47 @@ pipeline {
                 expression { return params.SKIP_REIMAGE == false }
             }
             steps {
-                withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
 
-                    sh '''#!/bin/bash
-                        set -euo pipefail
+                        sh '''#!/bin/bash
+                            set -euo pipefail
 
-                        OS="${OS:-}"
+                            OS="${OS:-}"
 
-                        cd "$REPO_DIR"
-                        source "$VENV_PATH/bin/activate"
+                            cd "$REPO_DIR"
+                            source "$VENV_PATH/bin/activate"
 
-                        if [ -z "${MACHINE}" ]; then
-                            echo "Error: MACHINE parameter is required."
-                            exit 1
-                        fi
+                            if [ -z "${MACHINE}" ]; then
+                                echo "Error: MACHINE parameter is required."
+                                exit 1
+                            fi
 
-                        echo "Preparing command…"
-                        CMD="python Jenkins_builder-reimage.py --action ${ACTION} --machine ${MACHINE}"
+                            echo "Preparing command…"
+                            CMD="python Jenkins_builder-reimage.py --action ${ACTION} --machine ${MACHINE}"
 
-                        if [ -n "${OS}" ]; then
-                            CMD="$CMD --os ${OS}"
-                        fi
+                            if [ -n "${OS}" ]; then
+                                CMD="$CMD --os ${OS}"
+                            fi
 
-                        echo "Running builder command:"
-                        echo "$CMD"
-                        eval $CMD
-                    '''
+                            echo "Running builder command:"
+                            echo "$CMD"
+                            eval $CMD
+                        '''
+                    }
                 }
             }
         }
 
         /* ---------------------------------------------------------------------
-           Stage 3: Wait for Deployed State (only if we reimaged)
+           Stage 3: Wait for Deployed State (only if reimage succeeded)
         --------------------------------------------------------------------- */
         stage('Wait for Ready/Deployed') {
             when {
-                expression { return params.SKIP_REIMAGE == false }
+                allOf {
+                    expression { return params.SKIP_REIMAGE == false }
+                    expression { return currentBuild.currentResult == 'SUCCESS' }
+                }
             }
             steps {
                 withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
@@ -106,12 +111,12 @@ pipeline {
         }
 
         /* ---------------------------------------------------------------------
-           Stage 4: Post Reimage Tasks (Ansible)
+           Stage 4: Post Reimage Tasks (Skipped if any previous stage failed)
         --------------------------------------------------------------------- */
         stage('Post Reimage Tasks') {
             when {
                 allOf {
-                    expression { return currentBuild.result == null || currentBuild.result == 'SUCCESS' }
+                    expression { return currentBuild.currentResult == 'SUCCESS' }
                 }
             }
             steps {
@@ -147,7 +152,6 @@ pipeline {
 
                         ###########################################################################
                         # CREATE VAULT PASSWORD FILE SECURELY
-                        # /home/jenkins-build/.vault_pass.txt
                         ###########################################################################
                         VAULT_FILE="/home/jenkins-build/.vault_pass.txt"
                         TMP_FILE="$(mktemp /tmp/vault.XXXXXX)"
@@ -158,8 +162,6 @@ pipeline {
                         mv -f "${TMP_FILE}" "${VAULT_FILE}"
                         chown jenkins:jenkins "${VAULT_FILE}" 2>/dev/null || true
                         chmod 600 "${VAULT_FILE}"
-
-                        echo "[INFO] Vault password file created at ${VAULT_FILE}"
                         ###########################################################################
 
 
