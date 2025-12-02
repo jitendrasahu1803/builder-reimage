@@ -74,15 +74,14 @@ pipeline {
                             echo "Running builder command:"
                             echo "$CMD"
 
-                            # Run and capture output
                             OUTPUT=$(eval $CMD | tee /tmp/reimage-output.txt)
                             echo "$OUTPUT"
 
-                            # Extract detected OS
+                            # Extract detected machine OS (if produced by script)
                             DETECTED_OS=$(grep -oP '^DETECTED_OS=\\K.*' /tmp/reimage-output.txt || true)
                             echo "DETECTED_OS=${DETECTED_OS}"
 
-                            # Persist for next stages
+                            # Persist to workspace for next stages
                             echo "DETECTED_OS=${DETECTED_OS}" > "$WORKSPACE/detected_os.env"
                         '''
                     }
@@ -134,11 +133,19 @@ pipeline {
                     sh '''#!/bin/bash
                         set -euo pipefail
 
-                        # Load DETECTED_OS
+                        ########################################################
+                        # SAFE LOAD OF DETECTED_OS — prevents "unbound variable"
+                        ########################################################
                         if [ -f "${WORKSPACE}/detected_os.env" ]; then
                             source "${WORKSPACE}/detected_os.env"
+                        else
+                            echo "[WARN] detected_os.env not found — using OS parameter instead."
+                            DETECTED_OS="${OS:-}"
                         fi
+
+                        : "${DETECTED_OS:=}"   # guarantee defined, even if empty
                         echo "Using DETECTED_OS=${DETECTED_OS}"
+                        ########################################################
 
                         cd "$REPO_DIR"
 
@@ -152,11 +159,13 @@ pipeline {
 
                         mkdir -p "${WORK_DIR}"
 
-                        # Private key for git
+                        # SSH key for Git clones
                         cp "${SSH_KEY}" /tmp/jenkins_git_key
                         chmod 600 /tmp/jenkins_git_key
 
-                        # Vault file
+                        ########################################################
+                        # Vault password file
+                        ########################################################
                         VAULT_FILE="/home/jenkins-build/.vault_pass.txt"
                         TMP_FILE="$(mktemp /tmp/vault.XXXXXX)"
                         umask 077
@@ -164,14 +173,18 @@ pipeline {
                         mv -f "${TMP_FILE}" "${VAULT_FILE}"
                         chmod 600 "${VAULT_FILE}"
 
+                        ########################################################
                         # prepare_env
+                        ########################################################
                         cd "$WORKSPACE/Jenkins-job/prod-jenkins/jenkins-pipeline/build"
                         bash scripts/prepare_env.sh "${TARGET_FQDN}" "${WORK_DIR}" true \
                             git@github.com:ceph/ceph-build.git \
                             git@github.com:ceph/ceph-cm-ansible.git \
                             git@github.com:ceph/ceph-sepia-secrets.git
 
-                        # ansible runner
+                        ########################################################
+                        # ansible_runner.sh (NOTE: VENV_DIR not VENV_PATH)
+                        ########################################################
                         cd "$WORKSPACE/Jenkins-job/prod-jenkins/jenkins-pipeline/build"
                         bash scripts/ansible_runner.sh \
                             "${TARGET_FQDN}" \
