@@ -33,7 +33,7 @@ pipeline {
                             rm -rf "$VENV_PATH"
                         fi
 
-                        python3 -m venv "$VENV_PATH"
+                        python3 -m vvenv "$VENV_PATH"
                         source "$VENV_PATH/bin/activate"
 
                         pip install --upgrade pip
@@ -44,12 +44,10 @@ pipeline {
         }
 
         /* ---------------------------------------------------------------------
-           Stage 2: Reimage Builder (Optional)
+           Stage 2: Reimage Builder
         --------------------------------------------------------------------- */
         stage('Reimage Builder') {
-            when {
-                expression { return params.SKIP_REIMAGE == false }
-            }
+            when { expression { return params.SKIP_REIMAGE == false } }
             steps {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
@@ -67,7 +65,6 @@ pipeline {
                                 exit 1
                             fi
 
-                            echo "Preparing command…"
                             CMD="python Jenkins_builder-reimage.py --action ${ACTION} --machine ${MACHINE}"
 
                             if [ -n "${OS}" ]; then
@@ -76,7 +73,17 @@ pipeline {
 
                             echo "Running builder command:"
                             echo "$CMD"
-                            eval $CMD
+
+                            # Run and capture output
+                            OUTPUT=$(eval $CMD | tee /tmp/reimage-output.txt)
+                            echo "$OUTPUT"
+
+                            # Extract detected OS
+                            DETECTED_OS=$(grep -oP '^DETECTED_OS=\\K.*' /tmp/reimage-output.txt || true)
+                            echo "DETECTED_OS=${DETECTED_OS}"
+
+                            # Persist for next stages
+                            echo "DETECTED_OS=${DETECTED_OS}" > "$WORKSPACE/detected_os.env"
                         '''
                     }
                 }
@@ -84,7 +91,7 @@ pipeline {
         }
 
         /* ---------------------------------------------------------------------
-           Stage 3: Wait for Deployed State (only if reimage succeeded)
+           Stage 3: Wait for Ready/Deployed
         --------------------------------------------------------------------- */
         stage('Wait for Ready/Deployed') {
             when {
@@ -96,8 +103,6 @@ pipeline {
             steps {
                 withCredentials([string(credentialsId: 'maas-api-key', variable: 'MAAS_API_KEY')]) {
                     script {
-                        echo "Waiting for ${MACHINE} to reach deployed/ready state..."
-
                         sh '''#!/bin/bash
                             set -euo pipefail
                             cd "$REPO_DIR"
@@ -111,7 +116,7 @@ pipeline {
         }
 
         /* ---------------------------------------------------------------------
-           Stage 4: Post Reimage Tasks (Skipped if any previous stage failed)
+           Stage 4: Post Reimage Tasks
         --------------------------------------------------------------------- */
         stage('Post Reimage Tasks') {
             when {
@@ -129,57 +134,50 @@ pipeline {
                     sh '''#!/bin/bash
                         set -euo pipefail
 
-                        OS="${OS:-}"
+                        # Load DETECTED_OS
+                        if [ -f "${WORKSPACE}/detected_os.env" ]; then
+                            source "${WORKSPACE}/detected_os.env"
+                        fi
+                        echo "Using DETECTED_OS=${DETECTED_OS}"
 
                         cd "$REPO_DIR"
 
-                        # Build FQDN from shortname
+                        # Build FQDN
                         if [ -z "${MACHINE}" ]; then
-                            echo "Error: MACHINE parameter is required for post reimage tasks."
+                            echo "Error: MACHINE parameter is required."
                             exit 1
                         fi
                         TARGET_FQDN="${MACHINE}.${DOMAIN}"
                         echo "FQDN = ${TARGET_FQDN}"
 
-                        # Ensure work dir
                         mkdir -p "${WORK_DIR}"
 
-                        # prepare private key for git clones (used by prepare_env)
+                        # Private key for git
                         cp "${SSH_KEY}" /tmp/jenkins_git_key
                         chmod 600 /tmp/jenkins_git_key
 
-
-
-                        ###########################################################################
-                        # CREATE VAULT PASSWORD FILE SECURELY
-                        ###########################################################################
+                        # Vault file
                         VAULT_FILE="/home/jenkins-build/.vault_pass.txt"
                         TMP_FILE="$(mktemp /tmp/vault.XXXXXX)"
-
                         umask 077
                         printf "%s" "${VAULT_PASS}" > "${TMP_FILE}"
-
                         mv -f "${TMP_FILE}" "${VAULT_FILE}"
-                        chown jenkins:jenkins "${VAULT_FILE}" 2>/dev/null || true
                         chmod 600 "${VAULT_FILE}"
-                        ###########################################################################
 
-
-
-                        # Call prepare_env
+                        # prepare_env
                         cd "$WORKSPACE/Jenkins-job/prod-jenkins/jenkins-pipeline/build"
                         bash scripts/prepare_env.sh "${TARGET_FQDN}" "${WORK_DIR}" true \
                             git@github.com:ceph/ceph-build.git \
                             git@github.com:ceph/ceph-cm-ansible.git \
                             git@github.com:ceph/ceph-sepia-secrets.git
 
-                        # Call ansible runner
+                        # ansible runner
                         cd "$WORKSPACE/Jenkins-job/prod-jenkins/jenkins-pipeline/build"
                         bash scripts/ansible_runner.sh \
                             "${TARGET_FQDN}" \
                             "${WORK_DIR}" \
-                            "${VENV_PATH}" \
-                            "${OS}" \
+                            "${VENV_DIR}" \
+                            "${DETECTED_OS}" \
                             "${BUILDER_TOKEN}" \
                             "${VAULT_PASS}"
                     '''
@@ -189,10 +187,12 @@ pipeline {
     }
 
     post {
-        always { 
+        always {
             sh 'rm -f /home/jenkins-build/.vault_pass.txt || true'
-            echo 'Build finished!' 
+            echo 'Build finished!'
         }
-        failure { echo 'Build failed!' }
+        failure {
+            echo 'Build failed!'
+        }
     }
 }
