@@ -198,7 +198,7 @@ pipeline {
                                                     source "$VENV_PATH/bin/activate"
 
                                                     MACHINE="${n}"
-                                                    OS="${OS:-}"
+                                                    OS="\${OS:-}"
 
                                                     CMD="python Jenkins_builder-reimage.py --action reimage --machine ${n}"
                                                     if [ -n "${OS}" ]; then CMD="\$CMD --os ${OS}"; fi
