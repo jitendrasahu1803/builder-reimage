@@ -1,29 +1,119 @@
-#!.venv/bin/python3
+#!/usr/bin/env python3
+
+"""
+MAAS Reimage Automation Script
+
+Provides:
+- Connect to MAAS
+- Query machines
+- List machines
+- Deploy a machine
+- Reimage a machine
+- Reimage all machines
+- List OS images
+"""
 
 import asyncio
 import argparse
-import json
-import os
+import configparser
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from cryptography.fernet import Fernet
+import os
+
 from maas.client import connect
-from aiohttp.client_exceptions import ClientConnectorError, ServerDisconnectedError, ClientResponseError, ClientOSError
+from aiohttp.client_exceptions import (
+    ClientConnectorError,
+    ServerDisconnectedError,
+    ClientResponseError,
+    ClientOSError
+)
 
-LOG_FILE_DEFAULT = "maas_redeploy.log"
+# -------------------------------------------------------------------------
+# Missing minimal helper functions required by main()
+# -------------------------------------------------------------------------
 
+def load_config():
+    # Prefer Jenkins MAAS_URL env if provided, else fall back to script constant
+    return os.environ.get("MAAS_URL", MAAS_URL)
 
-# -------------------- Logging -------------------- #
+def load_api_key():
+    return MAAS_API_KEY
+
+def get_machine(client, hostname):
+    """
+    Minimal helper used by wait_online(), returns dict with hostname & status_name.
+    """
+    machines = getattr(client, "_machines_cache", []) or []
+    for m in machines:
+        if m.hostname == hostname:
+            return {
+                "hostname": m.hostname,
+                "status_name": getattr(m, "status_name", None) or getattr(getattr(m, "status", None), "name", "-")
+            }
+    return {"hostname": hostname, "status_name": "Unknown"}
+
+# -------------------------------------------------------------------------
+# Global Defaults
+# -------------------------------------------------------------------------
+
+LOG_FILE_DEFAULT = "maas_reimage.log"
+STATUS_WAIT_TIMEOUT = 1200
+POLL_INTERVAL = 10
+DEFAULT_OWNER = "jitendra" # use --owner to tag manually
+
+# -------------------------------------------------------------------------
+# Small helpers
+# -------------------------------------------------------------------------
+
 def log(msg, log_file=None):
-    """Print and optionally log to a file."""
+    """Print message and optionally append to a log file with a timestamp."""
     print(msg)
     if log_file:
-        with open(log_file, "a") as f:
-            f.write(f"{datetime.now().isoformat()} - {msg}\n")
+        try:
+            with open(log_file, "a") as f:
+                f.write(f"{datetime.now().isoformat()} - {msg}\n")
+        except Exception:
+            print(f"(warning) Unable to write to log file: {log_file}")
 
+def sanitize_owner(name):
+    return name.replace(" ", "_").replace("@", "_")
 
-# -------------------- Configuration (use Jenkins credential via env) -------------------- #
-MAAS_URL = "http://refarch-r730xd-01.front.sepia.ceph.com:5240/MAAS"
+async def safe_list_tags_for_machine(machine):
+    """
+    Return list of tag objects applied to the machine.
+    Some MAAS clients expose machine.tags as a proxy; the reliable way is:
+    await machine.tags.list()
+    """
+    try:
+        return await machine.tags.list()
+    except Exception:
+        # fallback: try to read machine.tags attribute (may not be useful)
+        mt = getattr(machine, "tags", None)
+        if isinstance(mt, list):
+            return mt
+        return []
+
+def get_normalized_status(machine):
+    """
+    Return lowercased status name using the most reliable available attribute.
+    Handles both `status_name` and `status.name` forms.
+    """
+    status_name = getattr(machine, "status_name", None)
+    if status_name:
+        return str(status_name).lower()
+    status_obj = getattr(machine, "status", None)
+    if status_obj is not None:
+        name = getattr(status_obj, "name", None)
+        if name:
+            return str(name).lower()
+    return ""
+
+# -------------------------------------------------------------------------
+# Configuration (use Jenkins credential via env)
+# -------------------------------------------------------------------------
+MAAS_URL = "http://sepia-maas.front.sepia.ceph.com:5240/MAAS"
 
 # MAAS API key must be supplied by Jenkins as an environment variable named MAAS_API_KEY
 MAAS_API_KEY = os.environ.get("MAAS_API_KEY")
@@ -31,8 +121,10 @@ if not MAAS_API_KEY:
     print("Error: MAAS_API_KEY environment variable not set. Please configure your Jenkins job to pass the API key as an env var 'MAAS_API_KEY'.")
     sys.exit(1)
 
+# -------------------------------------------------------------------------
+# MAAS connect with retries
+# -------------------------------------------------------------------------
 
-# -------------------- Core Functions -------------------- #
 async def connect_maas(maas_url, api_key, retries=3):
     """Connect to MAAS with retries and clear error handling."""
     for attempt in range(1, retries + 1):
@@ -57,243 +149,566 @@ async def connect_maas(maas_url, api_key, retries=3):
     print("  • MAAS service availability")
     sys.exit(1)
 
+# -------------------------------------------------------------------------
+# Cache + refresh helpers
+# -------------------------------------------------------------------------
+
+async def get_cached_machines(client):
+    """Return a cached copy of client.machines.list() for script lifetime."""
+    if getattr(client, "_machines_cache", None) is None:
+        log("Fetching machines list...")
+        client._machines_cache = await client.machines.list()
+    return client._machines_cache
+
+async def refresh_machine(client, machine):
+    """
+    Refresh machine object. Prefer machine.refresh() if available.
+    """
+    try:
+        ref = getattr(machine, "refresh", None)
+        if callable(ref):
+            maybe = ref()
+            if asyncio.iscoroutine(maybe):
+                await maybe
+            return machine
+    except Exception:
+        pass
+
+    try:
+        return await client.machines.get(system_id=machine.system_id)
+    except Exception:
+        return machine
+
+# -------------------------------------------------------------------------
+# Tag-based ownership helpers
+# -------------------------------------------------------------------------
+
+async def ensure_tag_exists(client, tag_name, log_file=None):
+    """Ensure a tag with `tag_name` exists in MAAS; create it if not."""
+    try:
+        tags = await client.tags.list()
+        if not any(getattr(t, "name", t) == tag_name for t in tags):
+            log(f"Creating tag '{tag_name}'...", log_file)
+            await client.tags.create(name=tag_name)
+        return True
+    except Exception as e:
+        log(f"[ERROR] Unable to ensure tag exists '{tag_name}': {e}", log_file)
+        return False
+
+async def assign_owner_tag(client, machine, owner_name, log_file=None):
+    """
+    Assign owner tag to machine using client.tags.get() and machine.tags.add(tag).
+    Refresh machine after applying tag so later reads see it.
+    """
+    sanitized = sanitize_owner(owner_name)
+    if not await ensure_tag_exists(client, sanitized, log_file):
+        return False
+
+    try:
+        tag = await client.tags.get(name=sanitized)
+        applied = await safe_list_tags_for_machine(machine)
+        applied_names = [getattr(t, "name", None) for t in applied]
+        if sanitized in applied_names:
+            return True
+
+        log(f"Assigning tag '{sanitized}' to {machine.hostname}...", log_file)
+        await machine.tags.add(tag)
+        # Refresh so tag is visible
+        await refresh_machine(client, machine)
+        return True
+    except Exception as e:
+        log(f"[ERROR] Failed to assign tag '{sanitized}' to {getattr(machine, 'hostname', machine)}: {e}", log_file)
+        return False
+
+async def get_owner_from_tags(client, machine, owner_pattern):
+    """
+    Determine owner by checking machine's applied tags.
+    owner_pattern should be sanitized (e.g., DEFAULT_OWNER sanitized).
+    Returns the matching tag name or '-' if none.
+    """
+    try:
+        applied = await safe_list_tags_for_machine(machine)
+        applied_names = [getattr(t, "name", None) for t in applied]
+        if owner_pattern in applied_names:
+            return owner_pattern
+        # try prefix match too
+        for n in applied_names:
+            if n and n.startswith(owner_pattern):
+                return n
+    except Exception:
+        pass
+    return "-"
+
+# -------------------------------------------------------------------------
+# Query Machine
+# -------------------------------------------------------------------------
+
+async def query_machine(client, hostname, log_file=None, quiet=False):
+    """
+    Query machine details and print them.
+    Owner detection is tag-based (matches sanitized DEFAULT_OWNER).
+    """
+    owner_tag = "-"  # initialize to avoid undefined variable on errors
+
+    try:
+        machines = await get_cached_machines(client)
+    except Exception as e:
+        log(f"[ERROR] Unable to fetch machines list: {e}", log_file)
+        return None
+
+    system_id = None
+    for m in machines:
+        if m.hostname == hostname:
+            system_id = m.system_id
+            break
+
+    if not system_id:
+        log(f"[ERROR] Machine '{hostname}' not found.", log_file)
+        return None
+
+    try:
+        log(f"Fetching details for {hostname}...", log_file)
+        machine = await client.machines.get(system_id=system_id)
+    except Exception as e:
+        log(f"[ERROR] Unable to fetch machine details: {e}", log_file)
+        return None
+
+    if not quiet:
+        sanitized = sanitize_owner(DEFAULT_OWNER)
+        owner_tag = await get_owner_from_tags(client, machine, sanitized)
+
+        # Fetch all tags applied to this machine for display
+        try:
+            applied = await safe_list_tags_for_machine(machine)
+            tag_names = [getattr(t, "name", None) for t in applied if getattr(t, "name", None)]
+            tags_display = ", ".join(tag_names) if tag_names else "-"
+        except Exception:
+            tags_display = "-"
+
+        # resolve status display
+        status_display = getattr(machine, "status_name", None)
+        if not status_display:
+            st = getattr(machine, "status", None)
+            status_display = getattr(st, "name", "-") if st else "-"
+
+        log("\nMachine Details\n" + "-" * 60, log_file)
+        log(
+            f"Name:             {machine.hostname}\n"
+            f"System ID:        {machine.system_id}\n"
+            f"Status:           {status_display}\n"
+            f"OS Distro:        {getattr(machine, 'distro_series', '-')}\n"
+            f"OS Type:          {getattr(machine, 'osystem', '-')}\n"
+           # f"Owner:            {owner_tag}\n"
+           # f"Tags:             {tags_display}\n"
+            f"Power Type:       {getattr(machine, 'power_type', '-')}\n"
+            f"Power Status:     {getattr(machine, 'power_state', '-')}",
+            log_file
+        )
+
+    return machine
+
+# -------------------------------------------------------------------------
+# List machines / distros
+# -------------------------------------------------------------------------
 
 async def list_machines(client, log_file=None):
-    """List all MAAS machines."""
-    machines = await client.machines.list()
+    machines = await get_cached_machines(client)
     log(f"{'Hostname':20} | {'System ID':10} | {'Status':10} | {'OS':10}", log_file)
     log("-" * 65, log_file)
     for m in machines:
-        os_name = m.distro_series if getattr(m, "distro_series", None) else "-"
-        log(f"{m.hostname:20} | {m.system_id:10} | {m.status_name:10} | {os_name:10}", log_file)
-    return machines
-
-
-async def query_machine(client, hostname, log_file=None, quiet=False):
-    """Query a single machine and display detailed information."""
-    machines = await client.machines.list()
-    for m in machines:
-        if m.hostname == hostname:
-            # Fetch latest machine data to ensure up-to-date power info
-            machine = await client.machines.get(system_id=m.system_id)
-
-            os_name = getattr(machine, "distro_series", None) or "-"
-            os_type = getattr(machine, "osystem", None) or "-"
-            owner = getattr(machine, "owner", None)
-            owner_display = owner.get("username") if isinstance(owner, dict) and "username" in owner else str(owner or "-")
-            power_state = getattr(machine, "power_state", "Unknown")
-            power_type = getattr(machine, "power_type", "Unknown")
-#            cpu_count = getattr(machine, "cpu_count", "N/A")
-
-            if not quiet:
-                log(f"Machine Details{'-'*60}", log_file)
-                log(
-                    f"Name: {machine.hostname}"
-                    f"System ID: {machine.system_id}"
-                    f"Status: {machine.status_name}"
-                    f"OS Distro: {os_name}"
-                    f"OS Type: {os_type}"
-                    f"Owner: {owner_display}"
-                    f"Power Type: {power_type}"
-                    f"Power Status: {power_state}",
-                    log_file
-                )
-            return machine
-
-    log(f"Machine '{hostname}' not found.", log_file)
-    return None
+        status_display = getattr(m, "status_name", None) or getattr(getattr(m, "status", None), "name", "-")
+        osname = getattr(m, "distro_series", "-")
+        log(f"{m.hostname:20} | {m.system_id:10} | {status_display:10} | {osname:10}", log_file)
 
 async def list_distros(client, log_file=None):
-    """List all available OS distributions and their release versions."""
-    resources = await client.boot_resources.list()
-    log(f"{'ID':<5} | {'OS Type':<20} | {'Release':<20} | {'Architecture':<15}", log_file)
-    log("-" * 70, log_file)
-    
-    for res in resources:
-        # Many MAAS versions store distro info in 'name' like 'ubuntu/focal' or 'centos/stream9'
-        name = getattr(res, "name", "-")
+    try:
+        log("Fetching available OS images...", log_file)
+        resources = await client.boot_resources.list()
+    except Exception as e:
+        log(f"[ERROR] Unable to list boot resources: {e}", log_file)
+        return
+
+    log(f"{'ID':<5} | {'OS Type':<15} | {'Release':<15} | {'Architecture':<12}", log_file)
+    log("-" * 60, log_file)
+    for r in resources:
+        name = getattr(r, "name", "-")
         os_type, release = "-", "-"
         if "/" in name:
-            parts = name.split("/")
-            os_type = parts[0]
-            if len(parts) > 1:
-                release = parts[1]
-        elif getattr(res, "osystem", None):
-            os_type = res.osystem
-        elif getattr(res, "distro_series", None):
-            release = res.distro_series
+            os_type, release = name.split("/", 1)
+        log(f"{r.id:<5} | {os_type:<15} | {release:<15} | {r.architecture:<12}", log_file)
 
-        arch = getattr(res, "architecture", "-")
-        log(f"{res.id:<5} | {os_type:<20} | {release:<20} | {arch:<15}", log_file)
+# -------------------------------------------------------------------------
+# Status polling helper
+# -------------------------------------------------------------------------
 
-async def get_status(client, hostname, log_file=None):
-    """Check current status of a machine."""
-    m = await query_machine(client, hostname, log_file, quiet=True)
-    if m:
-        log(f"{hostname} → Current Status: {m.status_name}", log_file)
-        return m.status_name
-
-
-async def release_machine(client, machine):
-    """Release a machine if deployed."""
-    if machine.status_name.lower() == "deployed":
-        print(f"Releasing machine {machine.hostname}...")
-        await machine.release()
-
-
-async def wait_for_status(client, system_id, expected_status, timeout=900):
-    """Wait for a machine to reach a specific status."""
+async def wait_for_status(client, system_id, expected, timeout=STATUS_WAIT_TIMEOUT):
+    """
+    Wait for a machine to reach the expected state (case-insensitive).
+    """
+    log(f"Waiting for machine {system_id} to reach '{expected}'...", None)
     start = time.time()
+    poll = 2
+    max_poll = 8
+    expected_l = expected.lower()
+
     while time.time() - start < timeout:
-        m = await client.machines.get(system_id=system_id)
-        if m.status_name.lower() == expected_status.lower():
-            print(f"{m.hostname} reached status '{expected_status}'")
+        try:
+            m = await client.machines.get(system_id=system_id)
+        except Exception as e:
+            print(f"Error fetching machine {system_id}: {e}")
+            await asyncio.sleep(poll)
+            poll = min(max_poll, poll + 1)
+            continue
+
+        current = get_normalized_status(m)
+        if current == expected_l:
+            log(f"{getattr(m, 'hostname', system_id)} reached expected status: {expected}", None)
             return True
-        await asyncio.sleep(10)
-    print(f"Timeout waiting for {system_id} to reach {expected_status}")
+
+        await asyncio.sleep(poll)
+        poll = min(max_poll, poll + 1)
+
+    print(f"Timeout waiting for {system_id} to reach {expected}.")
     return False
 
+# -------------------------------------------------------------------------
+# Deploy machine
+# -------------------------------------------------------------------------
 
-async def deploy_machine(client, machine, os_release):
-    """Deploy a machine with given OS."""
-    print(f"Deploying {machine.hostname} with OS {os_release}...")
-    await machine.deploy(distro_series=os_release)
+async def deploy_machine(client, machine_ref, os_release=None, log_file=None):
+    """
+    Deploy (reimage) a machine. Accepts hostname (str) or machine object.
+    NOTE: this function assumes owner tag is already applied when called from reimage flow.
+    If user invokes deploy action directly, main() will ensure tag is applied before calling this.
+    """
+    if isinstance(machine_ref, str):
+        # Avoid calling query_machine() (which prints full details) to prevent duplicate fetches.
+        machines = await get_cached_machines(client)
+        found = next((m for m in machines if m.hostname == machine_ref), None)
+        if not found:
+            log(f"[ERROR] Machine '{machine_ref}' not found.", log_file)
+            return False
+        machine = await client.machines.get(system_id=found.system_id)
+    else:
+        machine = machine_ref
 
+    machine = await refresh_machine(client, machine)
 
-async def redeploy_machine(client, hostname, os_release=None, log_file=None):
-    """Redeploy a single machine."""
+    hostname = machine.hostname
+    system_id = machine.system_id
+    status = get_normalized_status(machine)
+
+    if status == "deployed":
+        log(f"[INFO] {hostname} is already deployed.", log_file)
+        return True
+
+    if status in ["failed", "broken", "error", "unknown"]:
+        log(f"[ERROR] {hostname} cannot be reimaged (state: {status}).", log_file)
+        return False
+
+    os_to_use = os_release or getattr(machine, "distro_series", None) or "focal"
+    log(f"[ACTION] Reimaging {hostname} using OS '{os_to_use}'...", log_file)
+
+    try:
+        await machine.deploy(distro_series=os_to_use)
+    except Exception as e:
+        log(f"[ERROR] Failed to trigger reimage for {hostname}: {e}", log_file)
+        return False
+
+    if not await wait_for_status(client, system_id, "deployed"):
+        log(f"[ERROR] Reimage timeout for {hostname}.", log_file)
+        return False
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    log(f"[SUCCESS] Reimage completed for {hostname}.", log_file)
+    log(f"[INFO] Deployment timestamp for {hostname}: {ts} IST", log_file)
+    return True
+
+# -------------------------------------------------------------------------
+# Release machine
+# -------------------------------------------------------------------------
+
+async def release_machine(client, machine, log_file=None):
+    status = get_normalized_status(machine)
+    if status != "deployed":
+        return True
+
+    log(f"[ACTION] Releasing {machine.hostname}...", log_file)
+    try:
+        await machine.release()
+        return True
+    except Exception as e:
+        log(f"[ERROR] Failed to release: {e}", log_file)
+        return False
+
+# -------------------------------------------------------------------------
+# Reimage machine
+# -------------------------------------------------------------------------
+
+async def reimage_machine(client, hostname, os_release=None, log_file=None):
+    # First, fetch machine (and print its details)
     machine = await query_machine(client, hostname, log_file)
     if not machine:
         return
 
-    current_os = getattr(machine, "distro_series", None) or "focal"
-    os_to_use = os_release or current_os
+    force_flag = getattr(args, "force", False)
+    status = get_normalized_status(machine)
 
-    if machine.status_name.lower() == "deployed":
-        await release_machine(client, machine)
-        await wait_for_status(client, machine.system_id, "Ready")
+    if force_flag and status == "deploying":
+        log(f"[FORCE] Aborting active deployment for {hostname}...", log_file)
+        try:
+            await machine.abort()
+        except Exception as e:
+            log(f"[ERROR] Unable to abort deployment for {hostname}: {e}", log_file)
+            return
 
-    await deploy_machine(client, machine, os_to_use)
-    await wait_for_status(client, machine.system_id, "Deployed")
+        if not await wait_for_status(client, machine.system_id, "ready"):
+            log("[ERROR] Machine did not reach Ready state after abort.", log_file)
+            return
 
-    log(f"Machine {hostname} successfully redeployed with {os_to_use}", log_file)
+        log(f"[FORCE] Deployment aborted. Releasing {hostname}...", log_file)
+        try:
+            await machine.release()
+        except Exception:
+            pass
 
+        if not await wait_for_status(client, machine.system_id, "ready"):
+            log("[ERROR] Machine did not reach Ready state after forced release.", log_file)
+            return
 
-async def redeploy_all(client, os_release=None, log_file=None):
-    """Redeploy all machines."""
-    machines = await client.machines.list()
+        machine = await refresh_machine(client, machine)
+
+    # Ensure owner tag is applied (only once here)
+    if not await assign_owner_tag(client, machine, DEFAULT_OWNER, log_file):
+        return
+
+    # choose OS
+    current_os = getattr(machine, "distro_series", None)
+    if os_release:
+        os_to_use = os_release
+    elif current_os:
+        os_to_use = current_os
+    else:
+        log(f"[ERROR] No OS detected for machine '{hostname}'. Provide --os.", log_file)
+        return
+
+    # if deployed -> release then wait for Ready
+    status = get_normalized_status(machine)
+    if status == "deployed":
+        log(f"[ACTION] Releasing {machine.hostname} for reimage...", log_file)
+        if not await release_machine(client, machine, log_file):
+            return
+        if not await wait_for_status(client, machine.system_id, "ready"):
+            log("[ERROR] Machine did not reach Ready state after release.", log_file)
+            return
+        machine = await refresh_machine(client, machine)
+
+    # trigger deploy (deploy_machine will not re-assign tag)
+    if await deploy_machine(client, hostname, os_to_use, log_file):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log(f"[SUCCESS] Reimage completed for {hostname}.", log_file)
+        log(f"[INFO] Reimage timestamp for {hostname}: {ts} IST", log_file)
+        # print detected OS for downstream consumption (simple marker)
+        print(f"DETECTED_OS={os_to_use}")
+
+# -------------------------------------------------------------------------
+# Reimage all machines
+# -------------------------------------------------------------------------
+
+async def reimage_all(client, os_release=None, log_file=None):
+    try:
+        machines = await get_cached_machines(client)
+    except Exception as e:
+        log(f"[ERROR] Unable to fetch machines list: {e}", log_file)
+        return
+
     for m in machines:
-        os_to_use = os_release or getattr(m, "distro_series", "focal")
-        await redeploy_machine(client, m.hostname, os_to_use, log_file)
+        hostname = m.hostname
+        target_os = os_release or getattr(m, "distro_series", "focal")
+        log(f"[INFO] Starting reimage for {hostname}", log_file)
+        try:
+            await reimage_machine(client, hostname, target_os, log_file)
+        except Exception as e:
+            log(f"[ERROR] Reimage error for {hostname}: {e}", log_file)
 
+# -------------------------------------------------------------------------
+# Find last deployed
+# -------------------------------------------------------------------------
 
-# -------------------- New helper: find last deployed machine -------------------- #
 async def find_last_deployed_machine(client):
-    """Return the machine object that was most recently deployed.
+    try:
+        machines = await get_cached_machines(client)
+    except Exception:
+        return None
 
-    Heuristics used:
-    - Try to read several common timestamp attributes on a machine object.
-    - Parse ISO timestamps where available and pick the most recent.
-    - If no timestamps are available, fall back to the latest machine with status 'Deployed'.
-    """
-    machines = await client.machines.list()
-    candidates = []
-
-    timestamp_attrs = [
-        "deployment_started_at", "deployed_at", "deployment_finished_at",
-        "commissioning_finished_at", "last_updated", "updated_at", "created_at", "created"
+    time_fields = [
+        "deployed_at", "deployment_finished_at", "deployment_completed",
+        "deployment_started", "deployment_started_at"
     ]
 
+    candidates = []
     for m in machines:
-        # Only consider machines that are in Deployed state
-        if getattr(m, "status_name", "").lower() != "deployed":
+        status = get_normalized_status(m)
+        if status != "deployed":
             continue
 
-        ts = None
-        for attr in timestamp_attrs:
-            val = getattr(m, attr, None)
-            if not val:
-                continue
-            # val may be a datetime already or a string
-            try:
-                if isinstance(val, str):
-                    # Support ISO format and fallback gracefully
-                    ts = datetime.fromisoformat(val)
-                elif isinstance(val, datetime):
-                    ts = val
-                else:
-                    # Try converting numeric timestamps
-                    ts = datetime.fromtimestamp(float(val))
-                break
-            except Exception:
-                # ignore parse errors and try next attr
-                ts = None
+        timestamp = None
+        for field in time_fields:
+            val = getattr(m, field, None)
+            if val:
+                try:
+                    if isinstance(val, str):
+                        val = val.replace("Z", "+00:00")
+                        timestamp = datetime.fromisoformat(val)
+                    elif isinstance(val, datetime):
+                        timestamp = val
+                except Exception:
+                    continue
+        if timestamp:
+            candidates.append((timestamp, m))
 
-        candidates.append((ts, m))
-
-    # Select the machine with the latest timestamp (None values will be sorted last)
-    candidates = [c for c in candidates if c[0] is not None]
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
 
-    # Fallback: return any machine with status 'Deployed' (choose the first)
     for m in machines:
-        if getattr(m, "status_name", "").lower() == "deployed":
+        if get_normalized_status(m) == "deployed":
             return m
 
     return None
 
+# -------------------------------------------------------------------------
+# wait_online
+#
+# This feature is dedicately added for Jenkins job only
+# because:
+#    After triggering MAAS reimage, machines enter deploying or rebooting state.
+#    Jenkins or MAAS does not guarantee immediate readiness.
+#    So a wait/poll function is required to safely run ansible afterwards. 
+# -------------------------------------------------------------------------
 
-# -------------------- Main Entry -------------------- #
+def wait_online(client, machine_name, timeout=1800, interval=20):
+    """
+    Poll MAAS for machine status until it's Deploying / Running / Ready.
+    """
+    import time
+
+    allowed_statuses = ["Deployed", "Ready", "Running"]
+
+    start = time.time()
+    while True:
+        machine = get_machine(client, machine_name)
+        status_name = machine.get("status_name", "")
+
+        print(f"[wait_online] {machine_name} status: {status_name}")
+
+        if status_name in allowed_statuses:
+            print(f"[wait_online] Machine {machine_name} is online and ready.")
+            return
+
+        if time.time() - start > timeout:
+            print(f"[wait_online] Timeout reached ({timeout}s). Machine not ready.")
+            sys.exit(1)
+
+        time.sleep(interval)
+
+
+# -------------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------------
+
 async def main():
+    global args
+    global DEFAULT_OWNER
+
     parser = argparse.ArgumentParser(description="MAAS Reimage Automation Script")
-    parser.add_argument("--action", required=True, choices=[
-        "list", "list-distros", "query", "status", "redeploy", "redeploy-all", "last-deployed"
-    ], help="Action to perform on MAAS machines")
-    parser.add_argument("--machine", help="Target hostname (use with --action query/status/redeploy)")
-    parser.add_argument("--os", help="Specify OS release (e.g. focal, jammy, centos-9-stream)")
-    parser.add_argument("--log-file", help="Optional log file path")
+    parser.add_argument("--action", required=True,
+                        choices=[
+                            "list", "list-distros", "query", "status",
+                            "deploy", "reimage", "reimage-all", "last-deployed", "wait_online"
+                        ])
+    parser.add_argument("--machine", help="Hostname for query, deploy, or reimage")
+    parser.add_argument("--os", help="Target OS release")
+    parser.add_argument("--log-file", help="Path to log file")
+    parser.add_argument("--force", action="store_true",
+                        help="Force reimage even if machine is deploying")
+    parser.add_argument("--owner", help="Owner username (fallback: DEFAULT_OWNER)")
 
     args = parser.parse_args()
-    client = await connect_maas(MAAS_URL, MAAS_API_KEY)
+
+    if args.owner:
+        DEFAULT_OWNER = args.owner
+
+    maas_url = load_config()
+    api_key = load_api_key()
+
+    client = await connect_maas(maas_url, api_key)
+
+    # initialize cache immediately
+    try:
+        client._machines_cache = await client.machines.list()
+    except Exception:
+        client._machines_cache = None
+
     log_file = args.log_file or LOG_FILE_DEFAULT
 
     if args.action == "list":
         await list_machines(client, log_file)
-    elif args.action == "list-distros":
-        await list_distros(client, log_file)
+
     elif args.action == "query":
         if not args.machine:
-            print("Please specify --machine for query action.")
+            print("Missing --machine")
         else:
             await query_machine(client, args.machine, log_file)
+
     elif args.action == "status":
         if not args.machine:
-            print("Please specify --machine for status action.")
+            print("Missing --machine")
         else:
-            await get_status(client, args.machine, log_file)
-    elif args.action == "redeploy":
-        if not args.machine:
-            print("Please specify --machine for redeploy action.")
-        else:
-            await redeploy_machine(client, args.machine, args.os, log_file)
-    elif args.action == "redeploy-all":
-        await redeploy_all(client, args.os, log_file)
-    elif args.action == "last-deployed":
-        m = await find_last_deployed_machine(client)
-        if m:
-            log(f"Last deployed machine: {m.hostname} ({m.system_id})", log_file)
-        else:
-            log(f"No deployed machines found.", log_file)
-    else:
-        print("Invalid action selected.")
+            await query_machine(client, args.machine, log_file)
 
+    elif args.action == "list-distros":
+        await list_distros(client, log_file)
+
+    elif args.action == "deploy":
+        if not args.machine:
+            print("Missing --machine")
+        else:
+            # ensure owner tag when user runs deploy directly
+            # fetch machine object (no extra printed details)
+            machines = await get_cached_machines(client)
+            found = next((m for m in machines if m.hostname == args.machine), None)
+            if not found:
+                log(f"[ERROR] Machine '{args.machine}' not found.", log_file)
+            else:
+                machine_obj = await client.machines.get(system_id=found.system_id)
+                await assign_owner_tag(client, machine_obj, DEFAULT_OWNER, log_file)
+                await deploy_machine(client, args.machine, args.os, log_file)
+
+    elif args.action == "reimage":
+        if not args.machine:
+            print("Missing --machine")
+        else:
+            await reimage_machine(client, args.machine, args.os, log_file)
+
+    elif args.action == "reimage-all":
+        await reimage_all(client, args.os, log_file)
+    
+    elif args.action == "wait_online":
+        wait_online(client, args.machine)
+
+    elif args.action == "last-deployed":
+        machine = await find_last_deployed_machine(client)
+        if machine:
+            log(f"Last deployed machine: {machine.hostname} ({machine.system_id})", log_file)
+        else:
+            log("No deployed machines found.", log_file)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Script interrupted by user.")
+        print("Interrupted by user.")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Fatal error: {e}")
