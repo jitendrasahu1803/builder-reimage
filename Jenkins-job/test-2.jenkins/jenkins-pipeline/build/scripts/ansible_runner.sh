@@ -162,4 +162,17 @@ run_playbook() {
   run_playbook "play4-main-builder" "${CMD}"
 )
 
+##############################################
+# PLAYBOOK 5 — grafana_agent.yml
+# (NO VAULT)
+##############################################
+(
+  cd "${ANSIBLE_DIR}"
+
+  CMD="ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -vvv \
+        grafana_agent.yml \
+        --limit='${TARGET_FQDN}'"
+
+  run_playbook "play5-grafana" "${CMD}"
+)
 echo "[ansible_runner] All playbooks completed successfully for ${TARGET_FQDN}"
