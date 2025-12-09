@@ -59,7 +59,7 @@ def get_machine(client, hostname):
 # -------------------------------------------------------------------------
 
 LOG_FILE_DEFAULT = "maas_reimage.log"
-STATUS_WAIT_TIMEOUT = 1200
+STATUS_WAIT_TIMEOUT = 1800
 POLL_INTERVAL = 10
 DEFAULT_OWNER = "jitendra" # use --owner to tag manually
 
