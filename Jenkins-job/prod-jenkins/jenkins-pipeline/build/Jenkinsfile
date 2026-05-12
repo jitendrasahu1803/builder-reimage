@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         VENV_DIR    = ".venv"
-        REPO_DIR    = "${WORKSPACE}/Jenkins-job/prod-jenkins"
+        REPO_DIR    = "${WORKSPACE}/builder-reimage/Jenkins-job/prod-jenkins"
         VENV_PATH   = "${REPO_DIR}/${VENV_DIR}"
         WORK_DIR    = "${WORKSPACE}/ci-work"
         DOMAIN      = "front.sepia.ceph.com"

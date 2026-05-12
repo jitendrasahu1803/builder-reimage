@@ -113,7 +113,7 @@ def get_normalized_status(machine):
 # -------------------------------------------------------------------------
 # Configuration (use Jenkins credential via env)
 # -------------------------------------------------------------------------
-MAAS_URL = "http://sepia-maas.front.sepia.ceph.com:5240/MAAS"
+MAAS_URL = "http://soko02.front.sepia.ceph.com:5240/MAAS"
 
 # MAAS API key must be supplied by Jenkins as an environment variable named MAAS_API_KEY
 MAAS_API_KEY = os.environ.get("MAAS_API_KEY")

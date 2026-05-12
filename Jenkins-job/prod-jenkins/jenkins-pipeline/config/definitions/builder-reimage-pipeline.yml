@@ -28,16 +28,16 @@
 
     scm:
       - git:
-          url: https://github.com/jitendrasahu1803/builder-reimage.git
+          url: https://github.com/ceph/ceph-build.git
           branches:
-            - main
+            - builder-reimage
           clean: true
 
     pipeline-scm:
       scm:
         - git:
-            url: https://github.com/jitendrasahu1803/builder-reimage.git
+            url: https://github.com/ceph/ceph-build.git
             branches:
-              - main
-      script-path: Jenkins-job/prod-jenkins/jenkins-pipeline/build/Jenkinsfile
+              - builder-reimage
+      script-path: builder-reimage/Jenkins-job/prod-jenkins/jenkins-pipeline/build/Jenkinsfile
       lightweight-checkout: true
